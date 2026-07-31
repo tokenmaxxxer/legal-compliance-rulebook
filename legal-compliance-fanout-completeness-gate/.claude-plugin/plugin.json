@@ -1,0 +1,6 @@
+{
+  "name": "legal-compliance-fanout-completeness-gate",
+  "description": "Enforces freelunch/parallel-fan-out sourcing completeness: any legal-compliance proposal or record that claims a multi-source or multi-angle survey (a \"Sources\" heading, or a heading using \"scout\"/\"sweep\"/\"compared against\"/\"survey\") must list at least two independently-attributed sources or angles, not one source restated. Fires on both docs/issue-<n>/proposals/*legal-compliance*.md and docs/issue-<n>/reports/legal-compliance.md write surfaces.",
+  "version": "1.0.0",
+  "author": {"name": "Jung Jiwon & Lee Jongkwan"}
+}

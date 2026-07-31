@@ -1,0 +1,6 @@
+{
+  "name": "legal-compliance-phase2-record-gate",
+  "description": "Enforces issue-1 phase-2 record norms (b1-b5): named regulation/standard list, graded red/amber/green risk rating, mitigations with 1:1 risk/clause mapping, and a verdict traceable to ratings, on docs/issue-<n>/reports/legal-compliance.md writes. Supersedes and retires the inline legal-compliance/hooks/record-fields-gate.sh, whose four presence checks are strictly subsumed by this gate's five checks.",
+  "version": "1.0.0",
+  "author": {"name": "Jung Jiwon & Lee Jongkwan"}
+}

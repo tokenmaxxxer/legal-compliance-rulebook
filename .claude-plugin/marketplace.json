@@ -8,6 +8,21 @@
       "name": "legal-compliance",
       "source": "./legal-compliance",
       "description": "The legal-compliance role on contract v3 (issue-160 round-3 promotion). Decides: 이 스펙/처리가 법·규제를 통과하는가."
+    },
+    {
+      "name": "legal-compliance-phase1-proposal-gate",
+      "source": "./legal-compliance-phase1-proposal-gate",
+      "description": "Enforces issue-1 phase-1 proposal norms (a1-a4) on legal-compliance proposal docs: stated scope/boundary, regulation enumeration with exclusions, necessity/proportionality rationale before mitigation, and an evidence/rationale section with per-position citation or assumption label."
+    },
+    {
+      "name": "legal-compliance-phase2-record-gate",
+      "source": "./legal-compliance-phase2-record-gate",
+      "description": "Enforces issue-1 phase-2 record norms (b1-b5): named regulation/standard list, graded red/amber/green risk rating, mitigations with 1:1 risk/clause mapping, and a verdict traceable to ratings, on legal-compliance phase-2 records. Supersedes the retired inline record-fields-gate.sh."
+    },
+    {
+      "name": "legal-compliance-fanout-completeness-gate",
+      "source": "./legal-compliance-fanout-completeness-gate",
+      "description": "Enforces freelunch/parallel-fan-out sourcing completeness on legal-compliance proposals and records: a document claiming a multi-source/multi-angle survey must show at least two independently-attributed sources or angles, not one restated."
     }
   ]
 }
