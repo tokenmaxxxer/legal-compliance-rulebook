@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 files:
   - legal-compliance/hooks/directive.sh
   - legal-compliance/hooks/hooks.json
