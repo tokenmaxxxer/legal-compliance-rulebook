@@ -1,0 +1,7 @@
+{
+  "name": "legal-compliance-phase1-proposal-gate",
+  "description": "Enforces issue-1 phase-1 proposal norms (a1-a4) on legal-compliance proposal docs: stated scope/boundary, regulation enumeration with exclusions, necessity/proportionality rationale before mitigation, and an evidence/rationale section with per-position citation or assumption label.",
+  "author": {
+    "name": "Jung Jiwon & Lee Jongkwan"
+  }
+}
