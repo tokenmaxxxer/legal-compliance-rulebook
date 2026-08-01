@@ -332,6 +332,32 @@ PY
 )"
 run_case_raw "case11: Bash write to matching path (deny)" "$payload11" 2
 
+# --- Case 12: missing-core (core #75-class defect) -> deny exit 2 --------
+payload12="$(python3 <<'PY'
+import json
+payload = {
+    "tool_name": "Write",
+    "tool_input": {
+        "file_path": "docs/issue-10/proposals/2026-07-31-legal-compliance-case12.md",
+        "content": "# Proposal\n\nNo sweep claim here.\n",
+    },
+}
+print(json.dumps(payload))
+PY
+)"
+set +e
+missing_core_output="$(printf '%s' "$payload12" | CLAUDE_PLUGIN_ROOT_CORE=/nonexistent/core "$GATE" 2>&1)"
+missing_core_rc=$?
+set -e
+if [ "$missing_core_rc" -eq 2 ] && printf '%s' "$missing_core_output" | grep -q "cannot source gate-lib.sh"; then
+  echo "PASS: case12: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: case12: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message (rc=$missing_core_rc)"
+  echo "  output: $missing_core_output"
+  fail_count=$((fail_count + 1))
+fi
+
 echo ""
 echo "Results: $pass_count passed, $fail_count failed"
 if [ "$fail_count" -eq 0 ]; then
