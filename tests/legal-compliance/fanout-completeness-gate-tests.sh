@@ -52,6 +52,30 @@ run_case() {
   fi
 }
 
+# run_case_raw: feed a pre-built raw JSON payload string (for Edit/MultiEdit/
+# Bash/malformed-JSON cases the simple Write-only build_payload can't build).
+run_case_raw() {
+  local name="$1" payload="$2" expected_rc="$3" env_prefix="${4:-}"
+  local actual_rc
+  set +e
+  if [ -n "$env_prefix" ]; then
+    printf '%s' "$payload" | env $env_prefix "$GATE" >/dev/null 2>"$TMPDIR_TESTS/stderr.txt"
+  else
+    printf '%s' "$payload" | "$GATE" >/dev/null 2>"$TMPDIR_TESTS/stderr.txt"
+  fi
+  actual_rc=$?
+  set -e
+
+  if [ "$actual_rc" = "$expected_rc" ]; then
+    echo "PASS: $name (rc=$actual_rc)"
+    pass_count=$((pass_count + 1))
+  else
+    echo "FAIL: $name (expected rc=$expected_rc, got rc=$actual_rc)"
+    echo "  stderr: $(cat "$TMPDIR_TESTS/stderr.txt")"
+    fail_count=$((fail_count + 1))
+  fi
+}
+
 TMPDIR_TESTS="$(mktemp -d "${TMPDIR:-/tmp}/fanout-gate-tests.XXXXXX")"
 trap 'rm -rf "$TMPDIR_TESTS"' EXIT
 
@@ -135,6 +159,178 @@ EOF
 run_case "case5: unrelated path (allow, no-op)" \
   "README.md" \
   "$TMPDIR_TESTS/case5.md" 0
+
+# --- Case 6: Edit with replace_all:true fixing a twice-occurring defect
+# (base doc has "## Sources" heading with only ONE distinct source, and the
+# repeated old_string "- placeholder" occurs twice; replace_all rewrites both
+# so a second distinct source is added) → allow
+# Baseline has 2 distinct sources (a.md, b.md) -> allow. replace_all:true
+# collapses every "a.md" occurrence (including the standalone one) into
+# "b.md", leaving only 1 distinct source -> deny. replace_all:false/absent
+# only replaces the first occurrence, leaving both a.md and b.md present
+# (still 2 distinct) -> allow. This direction actually exercises the
+# replace_all bug: a first-occurrence-only reconstruction would wrongly
+# leave the doc at 2 distinct sources (allow) in the replace_all:true case
+# too, since only one of the two a.md bullets would flip.
+FIXTURE6="docs/issue-10/proposals/2026-07-31-legal-compliance-case6.md"
+mkdir -p "$(dirname "$FIXTURE6")"
+cat >"$FIXTURE6" <<'EOF'
+# Proposal
+
+We surveyed sources before drafting this.
+
+## Sources
+
+- `docs/a.md`
+- `docs/a.md`
+- `docs/b.md`
+EOF
+payload6_true="$(python3 - "$FIXTURE6" <<'PY'
+import json, sys
+fp = sys.argv[1]
+payload = {
+    "tool_name": "Edit",
+    "tool_input": {
+        "file_path": fp,
+        "old_string": "`docs/a.md`",
+        "new_string": "`docs/b.md`",
+        "replace_all": True,
+    },
+}
+print(json.dumps(payload))
+PY
+)"
+run_case_raw "case6: Edit replace_all:true collapses to 1 distinct source (deny)" \
+  "$payload6_true" 2
+
+# Same fixture, replace_all:false/absent -> only first a.md flips, a.md and
+# b.md both still present -> 2 distinct -> allow.
+cat >"$FIXTURE6" <<'EOF'
+# Proposal
+
+We surveyed sources before drafting this.
+
+## Sources
+
+- `docs/a.md`
+- `docs/a.md`
+- `docs/b.md`
+EOF
+payload6_false="$(python3 - "$FIXTURE6" <<'PY'
+import json, sys
+fp = sys.argv[1]
+payload = {
+    "tool_name": "Edit",
+    "tool_input": {
+        "file_path": fp,
+        "old_string": "`docs/a.md`",
+        "new_string": "`docs/b.md`",
+    },
+}
+print(json.dumps(payload))
+PY
+)"
+run_case_raw "case6b: Edit replace_all absent still leaves 2 distinct sources (allow)" \
+  "$payload6_false" 0
+rm -f "$FIXTURE6"
+
+# --- Case 7: MultiEdit with mixed replace_all true/false building a fully
+# compliant (>=2 distinct sources) doc from a non-compliant base → allow
+FIXTURE7="docs/issue-10/reports/legal-compliance.md"
+mkdir -p "$(dirname "$FIXTURE7")"
+cat >"$FIXTURE7" <<'EOF'
+# Legal Compliance Record
+
+We surveyed sources before drafting this.
+
+## Sources
+
+- OLD_A
+- OLD_A
+EOF
+payload7="$(python3 - "$FIXTURE7" <<'PY'
+import json, sys
+fp = sys.argv[1]
+payload = {
+    "tool_name": "MultiEdit",
+    "tool_input": {
+        "file_path": fp,
+        "edits": [
+            {
+                "old_string": "- OLD_A",
+                "new_string": "- `docs/issue-1/proposals/legal-compliance-domain-norms.md`",
+                "replace_all": True,
+            },
+            {
+                "old_string": "## Sources\n\n- `docs/issue-1/proposals/legal-compliance-domain-norms.md`",
+                "new_string": "## Sources\n\n- `docs/issue-1/proposals/legal-compliance-domain-norms.md`\n- `docs/issue-5/reports/core-reference.md`",
+                "replace_all": False,
+            },
+        ],
+    },
+}
+print(json.dumps(payload))
+PY
+)"
+run_case_raw "case7: MultiEdit mixed replace_all builds compliant doc (allow)" \
+  "$payload7" 0
+rm -f "$FIXTURE7"
+
+# --- Case 8: malformed JSON — truncated, non-object top level, empty payload
+run_case_raw "case8a: truncated JSON (deny)" '{"tool_name": "Write", "tool_inp' 2
+run_case_raw "case8b: non-object top-level JSON (deny)" '["not", "an", "object"]' 2
+run_case_raw "case8c: empty payload (deny)" '' 2
+
+# --- Case 9: kill switch set to an unrecognized value → gate stays active
+cat >"$TMPDIR_TESTS/case9.md" <<'EOF'
+# Proposal
+
+We ran a sweep of prior art before drafting this.
+
+## Sources
+
+- `docs/issue-1/proposals/legal-compliance-domain-norms.md`
+EOF
+payload9="$(build_payload "docs/issue-10/proposals/2026-07-31-legal-compliance-case9.md" "$TMPDIR_TESTS/case9.md")"
+run_case_raw "case9: kill switch unrecognized value keeps gate active (deny)" \
+  "$payload9" 2 "LEGAL_COMPLIANCE_FANOUT_GATE_OFF=xyz"
+
+# --- Case 10: absolute file_path and ./-prefixed file_path variants of an
+# already-covered fixture → same expected result as the relative-path case
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cat >"$TMPDIR_TESTS/case10.md" <<'EOF'
+# Proposal
+
+We ran a sweep of prior art before drafting this.
+
+## Sources
+
+- `docs/issue-1/proposals/legal-compliance-domain-norms.md`
+EOF
+run_case "case10a: relative path, one source (deny, baseline)" \
+  "docs/issue-10/proposals/2026-07-31-legal-compliance-case10.md" \
+  "$TMPDIR_TESTS/case10.md" 2
+run_case "case10b: absolute file_path variant (deny)" \
+  "$REPO_ROOT/docs/issue-10/proposals/2026-07-31-legal-compliance-case10.md" \
+  "$TMPDIR_TESTS/case10.md" 2
+run_case "case10c: ./-prefixed file_path variant (deny)" \
+  "./docs/issue-10/proposals/2026-07-31-legal-compliance-case10.md" \
+  "$TMPDIR_TESTS/case10.md" 2
+
+# --- Case 11: Bash-tool write reaching a path matching PROPOSAL_RE or
+# RECORD_RE → deny regardless of command content
+payload11="$(python3 <<'PY'
+import json
+payload = {
+    "tool_name": "Bash",
+    "tool_input": {
+        "command": "printf 'x' > docs/issue-10/reports/legal-compliance.md",
+    },
+}
+print(json.dumps(payload))
+PY
+)"
+run_case_raw "case11: Bash write to matching path (deny)" "$payload11" 2
 
 echo ""
 echo "Results: $pass_count passed, $fail_count failed"

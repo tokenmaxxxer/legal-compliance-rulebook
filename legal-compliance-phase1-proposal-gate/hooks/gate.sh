@@ -4,55 +4,107 @@
 # PreToolUse gate enforcing issue-1 phase-1 proposal norms (a1-a4) on
 # legal-compliance proposal docs. See ../README.md for what it checks.
 #
-# Contract: reads a PreToolUse JSON payload on stdin (Write/Edit/MultiEdit),
-# resolves the would-be final file content, and exits 0 (allow) or 2 (deny,
-# message on stderr). Fails closed on any unexpected error.
+# Contract: reads a PreToolUse JSON payload on stdin (Write/Edit/MultiEdit/
+# Bash/NotebookEdit), resolves the would-be final file content, and exits
+# 0 (allow) or 2 (deny, message on stderr). Fails closed on any unexpected
+# error.
 
-set -euo pipefail
-
-on_error() {
-  echo "phase1-proposal-gate: internal error — failing closed (deny)" >&2
-  exit 2
-}
-trap on_error ERR
-
-# Kill switch: if set to any non-empty value, allow everything unchecked.
-if [[ -n "${LEGAL_COMPLIANCE_PHASE1_GATE_OFF:-}" ]]; then
-  exit 0
-fi
+. "${CLAUDE_PLUGIN_ROOT_CORE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../core" && pwd -P)}/hooks/lib/gate-lib.sh"
+gate_trap_fail_closed
+set -uo pipefail
+gate_kill_switch_active "${LEGAL_COMPLIANCE_PHASE1_GATE_OFF:-}" || { trap - EXIT; exit 0; }
 
 payload="$(cat)"
 
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$root" ]]; then
+  echo "phase1-proposal-gate: could not determine project root — failing closed" >&2
+  exit 2
+fi
+
 set +e
-python3 - "$payload" <<'PY'
+GATE_LIB_PY="$GATE_LIB_PY" GATE_ROOT="$root" python3 - "$payload" <<'PY'
+import importlib.util
 import json
 import os
 import re
 import sys
 
-payload_raw = sys.argv[1]
+_spec = importlib.util.spec_from_file_location("gate_lib", os.environ["GATE_LIB_PY"])
+gate_lib = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate_lib)
 
-try:
-    payload = json.loads(payload_raw)
-except Exception:
-    print("phase1-proposal-gate: could not parse PreToolUse JSON payload", file=sys.stderr)
+payload_raw = sys.argv[1]
+root = os.environ["GATE_ROOT"]
+
+
+def deny(msg):
+    print(f"phase1-proposal-gate: {msg}", file=sys.stderr)
     sys.exit(2)
 
-tool_name = payload.get("tool_name", "")
-tool_input = payload.get("tool_input", {}) or {}
+
+event = gate_lib.gate_parse_json_or_deny(payload_raw, deny)
+
+tool_name = event.get("tool_name", "")
+tool_input = event.get("tool_input", {}) or {}
+
+PATH_RE = re.compile(r"docs/issue-\d+/proposals/.*legal-compliance.*\.md$")
+
+# --- Shared heading helpers (mirrors fanout-completeness-gate) -----------
+
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+
+
+def extract_headings(text):
+    return [
+        (i, len(m.group(1)), m.group(2))
+        for i, line in enumerate(text.splitlines())
+        if (m := HEADING_RE.match(line))
+    ]
+
+
+def section_body(lines, headings, idx, level):
+    end = len(lines)
+    for (j, lvl, _t) in headings:
+        if j > idx and lvl <= level:
+            end = j
+            break
+    return "\n".join(lines[idx + 1:end])
+
+
+# --- Bash-tool write coverage (conservative: deny outright on match) -----
+
+if tool_name == "Bash":
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        command = ""
+    tokens = re.findall(r"[A-Za-z0-9_./~$-]+", command)
+    for token in tokens:
+        tail = gate_lib.gate_normalize_path(root, token)
+        if tail is not None and PATH_RE.search(tail):
+            deny(
+                "Bash-tool command appears to write to a path matching the "
+                "phase-1 proposal scope, but this gate cannot verify a "
+                "Bash-tool write's resulting content — refusing on "
+                "principle (conservative branch)."
+            )
+    sys.exit(0)
+
 file_path = tool_input.get("file_path")
 
 if not file_path:
     # Nothing to resolve against — no-op allow (not our surface).
     sys.exit(0)
 
-resolved_path = os.path.realpath(file_path)
+tail = gate_lib.gate_normalize_path(root, file_path)
+if tail is None:
+    sys.exit(0)
 
-PATH_RE = re.compile(r"docs/issue-\d+/proposals/.*legal-compliance.*\.md$")
-if not PATH_RE.search(resolved_path.replace(os.sep, "/")):
+if not PATH_RE.search(tail):
     sys.exit(0)
 
 # --- Compute final content for this write -------------------------------
+
 
 def read_current_content(path):
     try:
@@ -61,41 +113,23 @@ def read_current_content(path):
     except FileNotFoundError:
         return None
 
+
 if tool_name == "Write":
     final_content = tool_input.get("content", "")
-elif tool_name in ("Edit", "MultiEdit"):
+elif tool_name in ("Edit", "MultiEdit", "NotebookEdit"):
     current = read_current_content(file_path)
     if current is None:
-        current = read_current_content(resolved_path)
+        current = read_current_content(os.path.join(root, tail))
     if current is None:
         current = ""
 
-    if tool_name == "Edit":
-        old_string = tool_input.get("old_string", "")
-        new_string = tool_input.get("new_string", "")
-        if old_string and old_string not in current:
-            print(
-                "phase1-proposal-gate: Edit old_string not found in current "
-                "file content — failing closed",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        final_content = current.replace(old_string, new_string, 1) if old_string else current + new_string
-    else:  # MultiEdit
-        edits = tool_input.get("edits", []) or []
-        content = current
-        for edit in edits:
-            old_string = edit.get("old_string", "")
-            new_string = edit.get("new_string", "")
-            if old_string and old_string not in content:
-                print(
-                    "phase1-proposal-gate: MultiEdit old_string not found in "
-                    "current file content — failing closed",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            content = content.replace(old_string, new_string, 1) if old_string else content + new_string
-        final_content = content
+    new_text, ok = gate_lib.gate_reconstruct_write(tool_name, tool_input, current)
+    if not ok:
+        deny(
+            f"{tool_name} could not be reconstructed against current file "
+            "content — failing closed"
+        )
+    final_content = new_text
 else:
     # Not a write-shaped tool call on a matching path — allow, no-op.
     sys.exit(0)
@@ -103,7 +137,8 @@ else:
 # --- Checks (a1-a4) -------------------------------------------------------
 
 missing = []
-lower = final_content.lower()
+lines = final_content.splitlines()
+headings = extract_headings(final_content)
 
 # (a1) Scope/boundary statement.
 scope_re = re.compile(
@@ -119,36 +154,46 @@ if not scope_re.search(final_content):
 
 # (a2) Regulation enumeration section with at least one exclusion (or
 # explicit "no exclusions").
-reg_section_re = re.compile(
-    r"^#{1,6}[^\n]*(regulation|enumerat)[^\n]*$", re.IGNORECASE | re.MULTILINE
-)
-reg_match = reg_section_re.search(final_content)
-if not reg_match:
+reg_heading = None
+for (i, lvl, title) in headings:
+    if re.search(r"regulation|enumerat", title, re.IGNORECASE):
+        reg_heading = (i, lvl, title)
+        break
+
+if reg_heading is None:
     missing.append("regulation-enumeration section (heading mentioning regulations)")
 else:
-    # Look at the section body: from this heading to the next heading of
-    # equal-or-higher level, or end of doc.
-    start = reg_match.end()
-    next_heading = re.search(r"^#{1,6}\s", final_content[start:], re.MULTILINE)
-    section_body = final_content[start: start + next_heading.start()] if next_heading else final_content[start:]
+    i, lvl, _title = reg_heading
+    body = section_body(lines, headings, i, lvl)
     exclusion_re = re.compile(r"exclu(de|des|ding|sion)|no exclusions", re.IGNORECASE)
-    if not exclusion_re.search(section_body):
+    if not exclusion_re.search(body):
         missing.append(
             "exclusion statement within the regulation-enumeration section "
             "(or explicit 'no exclusions')"
         )
 
-# (a3) Necessity/proportionality language must appear before first
-# "mitigat" occurrence (pure string-offset ordering check).
+# (a3) Necessity/proportionality language must appear (in some section
+# body) at or before the section body first containing "mitigat".
 necessity_re = re.compile(r"necessity|proportionality|proportionate", re.IGNORECASE)
 mitigat_re = re.compile(r"mitigat", re.IGNORECASE)
 
-necessity_match = necessity_re.search(final_content)
-mitigat_match = mitigat_re.search(final_content)
+necessity_line = None
+mitigat_line = None
 
-if not necessity_match:
+for (i, lvl, _title) in headings:
+    body = section_body(lines, headings, i, lvl)
+    if necessity_line is None:
+        m = necessity_re.search(body)
+        if m:
+            necessity_line = i + 1 + body[:m.start()].count("\n")
+    if mitigat_line is None:
+        m = mitigat_re.search(body)
+        if m:
+            mitigat_line = i + 1 + body[:m.start()].count("\n")
+
+if necessity_line is None:
     missing.append("necessity/proportionality rationale language")
-elif mitigat_match and necessity_match.start() > mitigat_match.start():
+elif mitigat_line is not None and necessity_line > mitigat_line:
     missing.append(
         "necessity/proportionality rationale must appear before the first "
         "mention of mitigation (ordering violation)"
@@ -156,19 +201,20 @@ elif mitigat_match and necessity_match.start() > mitigat_match.start():
 
 # (a4) Evidence/rationale section: per-bullet citation or explicit
 # "assumption, unsourced" label.
-evidence_section_re = re.compile(
-    r"^#{1,6}[^\n]*(evidence|rationale)[^\n]*$", re.IGNORECASE | re.MULTILINE
-)
-evidence_match = evidence_section_re.search(final_content)
-if not evidence_match:
+evidence_heading = None
+for (i, lvl, title) in headings:
+    if re.search(r"evidence|rationale", title, re.IGNORECASE):
+        evidence_heading = (i, lvl, title)
+        break
+
+if evidence_heading is None:
     missing.append("Evidence/rationale section (heading containing 'evidence' or 'rationale')")
 else:
-    start = evidence_match.end()
-    next_heading = re.search(r"^#{1,6}\s", final_content[start:], re.MULTILINE)
-    section_body = final_content[start: start + next_heading.start()] if next_heading else final_content[start:]
+    i, lvl, _title = evidence_heading
+    section = section_body(lines, headings, i, lvl)
 
     bullet_lines = [
-        line for line in section_body.splitlines()
+        line for line in section.splitlines()
         if re.match(r"^\s*[-*]\s+\S", line)
     ]
 

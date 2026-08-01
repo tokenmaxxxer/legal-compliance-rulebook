@@ -153,6 +153,188 @@ print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": "README.md",
 
 run_case "unrelated path -> allow, no-op" "$payload_5" 0
 
+# --- Temp fixtures for Edit/MultiEdit replace_all cases --------------------
+
+FIXTURE_DIR="docs/issue-10/proposals"
+mkdir -p "$FIXTURE_DIR"
+FIXTURE_1="$(mktemp "${FIXTURE_DIR}/tmp-repl-legal-compliance-XXXXXX.md")"
+FIXTURE_2="$(mktemp "${FIXTURE_DIR}/tmp-multiedit-legal-compliance-XXXXXX.md")"
+
+cleanup_fixtures() {
+  rm -f "$FIXTURE_1" "$FIXTURE_2"
+}
+trap cleanup_fixtures EXIT
+
+# --- Case 6: Edit replace_all:true fixes both occurrences -> allow --------
+
+base_content_6='# Proposal
+
+## Scope
+
+PLACEHOLDER
+
+## Regulation enumeration
+
+We enumerate GDPR and CCPA. No exclusions.
+
+## Necessity and proportionality
+
+This approach is necessary and proportionate.
+
+Only after establishing that do we name a mitigation for the residual risk.
+
+## Evidence / rationale
+
+- Position A cites Art. 5 of GDPR.
+'
+printf '%s' "$base_content_6" > "$FIXTURE_1"
+
+payload_6=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Edit", "tool_input": {"file_path": sys.argv[1], "old_string": "PLACEHOLDER", "new_string": "In scope: the checkout API. Out of scope: billing.", "replace_all": True}}))
+' "$FIXTURE_1")
+
+run_case "Edit replace_all:true fixes occurrence -> allow" "$payload_6" 0
+
+# --- Case 7: Edit replace_all:false/absent leaves an occurrence -> deny ---
+
+base_content_7='# Proposal
+
+## Scope
+
+DUPTOKEN and something else DUPTOKEN too.
+
+## Regulation enumeration
+
+We enumerate GDPR and CCPA. No exclusions.
+
+## Necessity and proportionality
+
+This approach is necessary and proportionate.
+
+Only after establishing that do we name a mitigation for the residual risk.
+
+## Evidence / rationale
+
+- Position A cites Art. 5 of GDPR.
+'
+printf '%s' "$base_content_7" > "$FIXTURE_1"
+
+# Without replace_all, only the first DUPTOKEN gets fixed; the doc still
+# lacks a proper scope/boundary statement overall because the leftover
+# DUPTOKEN pollutes the section (scope_re still won't match cleanly).
+payload_7=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Edit", "tool_input": {"file_path": sys.argv[1], "old_string": "DUPTOKEN", "new_string": "placeholder-not-scope-language"}}))
+' "$FIXTURE_1")
+
+run_case "Edit replace_all:false/absent leaves occurrence unfixed -> deny" "$payload_7" 2
+
+# --- Case 8: MultiEdit two edits, one replace_all true + one false -> allow
+
+base_content_8='# Proposal
+
+## Scope
+
+SCOPETOKEN and SCOPETOKEN again.
+
+## Regulation enumeration
+
+We enumerate GDPR and CCPA. No exclusions.
+
+## Necessity and proportionality
+
+MITITOKEN
+
+Only after establishing that do we name a mitigation for the residual risk.
+
+## Evidence / rationale
+
+- Position A cites Art. 5 of GDPR.
+'
+printf '%s' "$base_content_8" > "$FIXTURE_2"
+
+payload_8=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "tool_name": "MultiEdit",
+    "tool_input": {
+        "file_path": sys.argv[1],
+        "edits": [
+            {"old_string": "SCOPETOKEN", "new_string": "In scope: the checkout API. Out of scope: billing.", "replace_all": True},
+            {"old_string": "MITITOKEN", "new_string": "This approach is necessary and proportionate.", "replace_all": False},
+        ],
+    },
+}))
+' "$FIXTURE_2")
+
+run_case "MultiEdit mixed replace_all edits both land -> allow" "$payload_8" 0
+
+# --- Case 9: malformed JSON variants -> deny -------------------------------
+
+run_case "malformed JSON: truncated -> deny" '{"tool_name": "Write", "tool_in' 2
+run_case "malformed JSON: top-level string -> deny" '"just a string"' 2
+run_case "malformed JSON: empty stdin -> deny" '' 2
+
+# --- Case 10: kill switch typo value stays ACTIVE (denies) -----------------
+
+actual_output="$(printf '%s' "$payload_1" | LEGAL_COMPLIANCE_PHASE1_GATE_OFF=xyz bash "$GATE" 2>&1)"
+actual_exit=$?
+if [[ "$actual_exit" -eq 2 ]]; then
+  echo "PASS: kill switch typo value 'xyz' stays ACTIVE (denies)"
+  PASS_COUNT=$((PASS_COUNT + 1))
+else
+  echo "FAIL: kill switch typo value 'xyz' stays ACTIVE (denies) (expected exit 2, got $actual_exit)"
+  echo "  output: $actual_output"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+actual_output="$(printf '%s' "$payload_1" | LEGAL_COMPLIANCE_PHASE1_GATE_OFF=0 bash "$GATE" 2>&1)"
+actual_exit=$?
+if [[ "$actual_exit" -eq 2 ]]; then
+  echo "PASS: kill switch typo value '0' stays ACTIVE (denies)"
+  PASS_COUNT=$((PASS_COUNT + 1))
+else
+  echo "FAIL: kill switch typo value '0' stays ACTIVE (denies) (expected exit 2, got $actual_exit)"
+  echo "  output: $actual_output"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# --- Case 11: absolute and ./-prefixed file_path variants ------------------
+
+abs_path="$(pwd)/docs/issue-10/proposals/x-legal-compliance.md"
+dotslash_path="./docs/issue-10/proposals/x-legal-compliance.md"
+
+payload_11a=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": sys.argv[1], "content": sys.stdin.read()}}))
+' "$abs_path" <<<"$content_3")
+
+run_case "absolute file_path, conforming doc -> allow" "$payload_11a" 0
+
+payload_11b=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": sys.argv[1], "content": sys.stdin.read()}}))
+' "$dotslash_path" <<<"$content_3")
+
+run_case "./-prefixed file_path, conforming doc -> allow" "$payload_11b" 0
+
+payload_11c=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": sys.argv[1], "content": sys.stdin.read()}}))
+' "$abs_path" <<<"$content_1")
+
+run_case "absolute file_path, denying doc -> deny" "$payload_11c" 2
+
+# --- Case 12: Bash-tool write reaching gate scope -> deny -------------------
+
+payload_12=$(python3 -c '
+import json
+print(json.dumps({"tool_name": "Bash", "tool_input": {"command": "cp foo docs/issue-10/proposals/y-legal-compliance.md"}}))
+')
+
+run_case "Bash-tool write into gate scope -> deny" "$payload_12" 2
+
 echo
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 

@@ -1,117 +1,263 @@
-import json, os, re, sys
+"""legal-compliance-phase2-record-gate / hooks/checker.py
+
+Reads a PreToolUse JSON payload on stdin, checks it against issue-1
+phase-2 record norms (b1-b5) plus the 1:1 mitigation-to-risk/clause
+mapping heuristic, and:
+  - prints nothing, exits 0 on allow (including non-matching paths/tools)
+  - prints "phase2-record-gate: <reason>" to stderr, exits 2 on deny
+
+Invoked by gate.sh as: python3 checker.py, with GATE_LIB_PY and GATE_ROOT
+set in the environment. Uses core's gate-lib.py (loaded via importlib) for
+JSON parsing, path normalization, and Write/Edit/MultiEdit/NotebookEdit
+content reconstruction — see docs/issue-13 gate-house-standard adoption.
+"""
+
+import importlib.util
+import os
+import re
+import sys
+
+_spec = importlib.util.spec_from_file_location("gate_lib", os.environ["GATE_LIB_PY"])
+gate_lib = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate_lib)
+
+ROOT = os.environ.get("GATE_ROOT", "")
+
+RECORD_RE = re.compile(r"docs/issue-\d+/reports/legal-compliance\.md$")
 
 
-def fail_internal(msg):
-    sys.stderr.write(msg + "\n")
-    sys.exit(3)
+def deny(msg):
+    sys.stderr.write(f"phase2-record-gate: {msg}\n")
+    sys.exit(2)
 
 
-try:
-    raw = sys.stdin.read()
-    payload = json.loads(raw)
-except Exception as e:
-    fail_internal(f"could not parse hook payload JSON: {e}")
+raw = sys.stdin.read()
+event = gate_lib.gate_parse_json_or_deny(raw, deny)
 
-tool_name = payload.get("tool_name", "")
-tool_input = payload.get("tool_input", {})
+tool_name = event.get("tool_name", "")
+tool_input = event.get("tool_input", {}) or {}
 if not isinstance(tool_input, dict):
-    fail_internal("tool_input missing or not an object")
+    deny("tool_input missing or not an object")
+
+# --- Bash-tool write coverage: conservative refusal, no content check ---
+
+if tool_name == "Bash":
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        command = ""
+    tokens = re.findall(r"[A-Za-z0-9_./~$-]+", command)
+    for token in tokens:
+        tail = gate_lib.gate_normalize_path(ROOT, token)
+        if tail is not None and RECORD_RE.search(tail):
+            deny(
+                "Bash-tool command appears to write to a path matching the "
+                "phase-2 record scope, but this gate cannot verify a "
+                "Bash-tool write's resulting content — refusing "
+                "conservatively."
+            )
+    sys.exit(0)
+
+if tool_name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+    # Matcher only wires these tools plus Bash above; stay fail-closed-safe
+    # rather than guessing about an unrecognized tool.
+    sys.exit(0)
 
 file_path = tool_input.get("file_path")
 if not file_path:
-    fail_internal("tool_input.file_path missing")
-
-resolved = os.path.realpath(file_path)
-
-# Only fire on docs/issue-<n>/reports/legal-compliance.md
-if not re.search(r'docs/issue-[0-9]+/reports/legal-compliance\.md$', resolved.replace(os.sep, "/")):
     sys.exit(0)
 
-# Compute final content per tool type.
+tail = gate_lib.gate_normalize_path(ROOT, file_path)
+if tail is None:
+    sys.exit(0)
+
+if not RECORD_RE.search(tail):
+    sys.exit(0)
+
+# --- Compute final content for this write -------------------------------
+
+
+def read_current_content(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
 if tool_name == "Write":
-    content = tool_input.get("content", "")
-elif tool_name in ("Edit", "MultiEdit"):
-    if os.path.isfile(resolved):
-        with open(resolved, "r", encoding="utf-8") as f:
-            content = f.read()
-    else:
-        content = ""
-
-    if tool_name == "Edit":
-        edits = [{"old_string": tool_input.get("old_string", ""),
-                  "new_string": tool_input.get("new_string", "")}]
-    else:
-        edits = tool_input.get("edits", [])
-        if not isinstance(edits, list):
-            fail_internal("tool_input.edits missing or not a list for MultiEdit")
-
-    for e in edits:
-        old = e.get("old_string", "")
-        new = e.get("new_string", "")
-        if old not in content:
-            fail_internal(f"old_string not found in current content of {resolved} — failing closed")
-        content = content.replace(old, new, 1)
+    final_content = tool_input.get("content", "")
+    if not isinstance(final_content, str):
+        deny("tool_input.content missing or not a string for Write")
 else:
-    # Unrecognized tool_name for this matcher: nothing to check, allow.
-    sys.exit(0)
+    current = read_current_content(file_path)
+    if current is None:
+        current = read_current_content(os.path.join(ROOT, tail))
+    if current is None:
+        current = ""
+
+    new_text, ok = gate_lib.gate_reconstruct_write(tool_name, tool_input, current)
+    if not ok:
+        deny(
+            f"{tool_name} could not be reconstructed against current file "
+            f"content of {tail} — failing closed"
+        )
+    final_content = new_text
+
+# --- Shared heading helpers (mirrors fanout-completeness-gate) ----------
+
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+
+
+def extract_headings(text):
+    return [
+        (i, len(m.group(1)), m.group(2))
+        for i, line in enumerate(text.splitlines())
+        if (m := HEADING_RE.match(line))
+    ]
+
+
+def section_body(lines, headings, idx, level):
+    end = len(lines)
+    for (j, lvl, _t) in headings:
+        if j > idx and lvl <= level:
+            end = j
+            break
+    return "\n".join(lines[idx + 1:end])
+
+
+lines = final_content.splitlines()
+headings = extract_headings(final_content)
 
 missing = []
 
-# --- The four checks carried over from record-fields-gate.sh ---
-if not re.search(r'regulation|standard', content, re.IGNORECASE):
-    missing.append("named regulation/standard list")
 
-if not re.search(r'\b(red|amber|green)\b', content, re.IGNORECASE):
-    missing.append("graded (red/amber/green) risk rating per issue")
+def find_heading(predicate):
+    for (i, lvl, title) in headings:
+        if predicate(title):
+            return (i, lvl, title)
+    return None
 
-if not re.search(r'mitigat', content, re.IGNORECASE):
-    missing.append("mitigations mapped to risks")
 
-if not re.search(r'\b(pass-with-mitigations|pass|fail)\b', content, re.IGNORECASE):
-    missing.append("final verdict (pass / pass-with-mitigations / fail)")
+# --- (1) Named regulation/standard list, section-scoped ------------------
 
-# --- New heuristic: 1:1 mitigation-bullet to risk/clause reference ---
-# Find the Mitigations section (a heading containing "mitigat"), and
-# within it, bullet lines starting with '-' or '*'. Also treat any
-# bullet line elsewhere containing "mitigat" as a mitigation bullet.
-lines = content.splitlines()
+reg_heading = find_heading(
+    lambda t: "regulation" in t.lower() or "standard" in t.lower()
+)
+regulations_body = ""
+if reg_heading is None:
+    missing.append("named regulation/standard list (heading mentioning regulation/standard)")
+else:
+    i, lvl, _t = reg_heading
+    regulations_body = section_body(lines, headings, i, lvl)
+    if not re.search(r"regulation|standard", regulations_body, re.IGNORECASE):
+        missing.append(
+            "named regulation/standard list within the regulations section"
+        )
+
+# --- (2) Graded (red/amber/green) risk rating, section-scoped -----------
+
+risk_heading = find_heading(lambda t: "risk" in t.lower())
+if risk_heading is None:
+    missing.append("graded (red/amber/green) risk rating per issue (no risk-rating heading)")
+else:
+    i, lvl, _t = risk_heading
+    risk_body = section_body(lines, headings, i, lvl)
+    if not re.search(r"\b(red|amber|green)\b", risk_body, re.IGNORECASE):
+        missing.append(
+            "graded (red/amber/green) risk rating per issue within the risk section"
+        )
+
+# --- (3) Mitigations mapped to risks, section-scoped ---------------------
+
+mitigations_heading = find_heading(lambda t: "mitigat" in t.lower())
+mitigations_body = ""
+if mitigations_heading is None:
+    missing.append("mitigations mapped to risks (no mitigations heading)")
+else:
+    i, lvl, _t = mitigations_heading
+    mitigations_body = section_body(lines, headings, i, lvl)
+    if not re.search(r"mitigat", mitigations_body, re.IGNORECASE):
+        missing.append("mitigations mapped to risks within the mitigations section")
+
+# --- (4) Final verdict, section-scoped -----------------------------------
+
+verdict_heading = find_heading(lambda t: "verdict" in t.lower())
+if verdict_heading is None:
+    missing.append("final verdict (pass / pass-with-mitigations / fail) (no verdict heading)")
+else:
+    i, lvl, _t = verdict_heading
+    verdict_body = section_body(lines, headings, i, lvl)
+    if not re.search(r"\b(pass-with-mitigations|pass|fail)\b", verdict_body, re.IGNORECASE):
+        missing.append(
+            "final verdict (pass / pass-with-mitigations / fail) within the verdict section"
+        )
+
+# --- (5) 1:1 mitigation-bullet to risk/clause mapping, with adjacency ----
+# Mitigation bullets: any bullet inside the mitigations section, plus any
+# bullet elsewhere whose text mentions "mitigat" (kept from the prior
+# whole-document heuristic so a stray mitigation bullet outside the named
+# section is still caught).
+
+bullet_re = re.compile(r"^\s*[-*]\s+(.*)$")
+
+mitigations_section_range = None
+if mitigations_heading is not None:
+    i, lvl, _t = mitigations_heading
+    end = len(lines)
+    for (j, l2, _t2) in headings:
+        if j > i and l2 <= lvl:
+            end = j
+            break
+    mitigations_section_range = (i + 1, end)
+
 mitigation_bullets = []
-in_mitigations_section = False
-heading_re = re.compile(r'^\s{0,3}#{1,6}\s+(.*)$')
-bullet_re = re.compile(r'^\s*[-*]\s+(.*)$')
-
-for line in lines:
-    h = heading_re.match(line)
-    if h:
-        in_mitigations_section = bool(re.search(r'mitigat', h.group(1), re.IGNORECASE))
-        continue
+for idx, line in enumerate(lines):
     b = bullet_re.match(line)
-    if b:
-        bullet_text = b.group(1)
-        if in_mitigations_section or re.search(r'mitigat', bullet_text, re.IGNORECASE):
-            mitigation_bullets.append(bullet_text)
+    if not b:
+        continue
+    text = b.group(1)
+    in_section = (
+        mitigations_section_range is not None
+        and mitigations_section_range[0] <= idx < mitigations_section_range[1]
+    )
+    if in_section or re.search(r"mitigat", text, re.IGNORECASE):
+        mitigation_bullets.append(text)
 
-# A bullet line "cites a risk/clause reference" if it contains a named
-# regulation/standard token, a clause marker (Art., §, section, clause),
-# the word "risk", or a reference to a named issue (e.g. "issue-3",
-# "issue #3").
+# `\brisk\b` dropped from ref_re per the confirmed audit bug: citing the
+# bare word "risk" is not a reference to any specific regulation/clause.
 ref_re = re.compile(
-    r'(Art\.|§|\bsection\b|\bclause\b|\brisk\b|\bregulation\b|\bstandard\b|'
-    r'\bissue[-\s#]?\d+\b)',
+    r"(Art\.|§|\bsection\b|\bclause\b|\bregulation\b|\bstandard\b|"
+    r"\bissue[-\s#]?\d+\b)",
     re.IGNORECASE,
 )
 
-unref_bullets = [b for b in mitigation_bullets if not ref_re.search(b)]
+unref_bullets = []
+for bullet in mitigation_bullets:
+    m = ref_re.search(bullet)
+    if not m:
+        unref_bullets.append(bullet)
+        continue
+    # Adjacency: the cited token must actually resolve to text present in
+    # the Regulations section body (or no Regulations section exists at
+    # all, in which case adjacency cannot be checked and we fall back to
+    # the citation-shape check alone).
+    token_text = m.group(1)
+    if regulations_body and token_text.lower() not in regulations_body.lower():
+        unref_bullets.append(bullet)
+
 if unref_bullets:
     missing.append(
         "1:1 mitigation-to-risk/clause mapping: mitigation bullet(s) with no "
-        "risk/clause reference: " + "; ".join(repr(b) for b in unref_bullets)
+        "risk/clause reference that resolves to the Regulations section: "
+        + "; ".join(repr(b) for b in unref_bullets)
     )
 
 if missing:
-    print(f"phase2-record-gate: missing required element(s) in {resolved}:")
+    sys.stderr.write(f"phase2-record-gate: missing required element(s) in {tail}:\n")
     for m in missing:
-        print(f"  - {m}")
-    sys.exit(1)
+        sys.stderr.write(f"  - {m}\n")
+    sys.exit(2)
 
 sys.exit(0)
