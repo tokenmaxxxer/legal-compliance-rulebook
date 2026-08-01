@@ -17,21 +17,26 @@ different label.
 
 ## Check logic
 
-1. Kill switch check (`LEGAL_COMPLIANCE_FANOUT_GATE_OFF`) — any
-   non-empty value disables the gate and allows immediately.
-2. Resolve `tool_input.file_path` to a real path and match it against
-   both write surfaces this plugin fires on:
+1. Kill switch check (`LEGAL_COMPLIANCE_FANOUT_GATE_OFF`) — a
+   recognized on-spelling (`1`/`true`/`yes`/`on`, case-insensitive)
+   disables the gate and allows immediately. Any other value —
+   including the empty string or an unrecognized typo — leaves the
+   gate active.
+2. Fires on `Write`/`Edit`/`MultiEdit`/`Bash`/`NotebookEdit`. For
+   `Bash`, scan the command's tokens for one that resolves to a path
+   matching either write surface below and deny outright, conservatively
+   (this gate cannot verify a Bash-tool write's resulting content). For
+   the other tools, resolve `tool_input.file_path` to a real path and
+   match it against both write surfaces this plugin fires on:
    - `docs/issue-<n>/proposals/.*legal-compliance.*\.md`
    - `docs/issue-<n>/reports/legal-compliance\.md`
 
    Any other resolved path: allow immediately (no-op).
 3. Compute the resulting file content for the pending write:
    - `Write`: `tool_input.content` verbatim.
-   - `Edit`: read the current on-disk content and replace
-     `old_string` with `new_string`; if `old_string` is not found,
-     fail closed (deny).
-   - `MultiEdit`: same as `Edit`, applying each entry in
-     `tool_input.edits` in order.
+   - `Edit`/`MultiEdit`/`NotebookEdit`: reconstruct against the current
+     on-disk content; if the edit can't be reconstructed, fail closed
+     (deny).
 4. Scan the resulting content for a **sweep/survey claim**: a
    markdown heading containing "sources" (case-insensitive), or a
    heading containing any of "scout", "sweep", "compared against",
@@ -64,17 +69,21 @@ rationale.
 
 ## Kill switch
 
-`LEGAL_COMPLIANCE_FANOUT_GATE_OFF` — set to any non-empty value to
-disable this gate entirely (exit 0 without checking anything). Scoped
+`LEGAL_COMPLIANCE_FANOUT_GATE_OFF` — set to a recognized on-spelling
+(`1`/`true`/`yes`/`on`, case-insensitive) to disable this gate entirely
+(exit 0 without checking anything). Any other value, including the
+empty string or an unrecognized typo, leaves the gate active. Scoped
 to this plugin only; it does not affect `phase1-proposal-gate` or
 `phase2-record-gate`, each of which has its own kill switch.
 
 ## Pattern precedent
 
-The overall shape (bash wrapper with `set -euo pipefail` plus a `trap`
-that fails closed on any unexpected error, a dedicated kill-switch env
-var, JSON parsing done in an embedded `python3` block) follows the
-pattern scouted from `pricing-rulebook`'s `pricing/hooks/methodology-gate.sh`.
+The overall shape (bash wrapper that sources core's `gate-lib.sh` behind
+an `||` guard, installs `gate_trap_fail_closed` as an `EXIT` trap that
+fails closed on any unexpected error, runs under `set -uo pipefail`, a
+dedicated kill-switch env var, JSON parsing done in an embedded
+`python3` block) follows the pattern scouted from `pricing-rulebook`'s
+`pricing/hooks/methodology-gate.sh`.
 No content from that file (or from `core/hooks/`) is vendored here —
 `hooks/gate.sh` in this plugin is a new, role-specific script written
 for this methodology's checks only.

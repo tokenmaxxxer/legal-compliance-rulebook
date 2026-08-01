@@ -335,6 +335,41 @@ pass-with-mitigations
 run_case "fully section-scoped compliant record allows" 0 \
   "$(json_write_payload "$RECORD_PATH" "$content_section_scoped_conforming")"
 
+# --- Case 14: issue-16 audit-bug fix — bare "section" is not a reference -
+
+content_bare_section_mitigation='# Legal Compliance Record — issue-42
+
+## Regulations
+- GDPR Art. 32 (data protection)
+- ISO 27001 standard, clause 9 (security)
+
+## Risk Rating
+- Data retention: red
+- Access control: amber
+- Logging: green
+
+## Mitigations
+- mitigate this per the risk section above
+
+## Verdict
+pass-with-mitigations
+'
+run_case "mitigation bullet citing bare 'section' denies (issue-16 audit-bug fix)" 2 \
+  "$(json_write_payload "$RECORD_PATH" "$content_bare_section_mitigation")"
+
+# --- Case 15: missing-core (core #75-class defect) -> deny exit 2 --------
+
+missing_core_output="$(printf '%s' "$(json_write_payload "$RECORD_PATH" "$content_conforming")" | CLAUDE_PLUGIN_ROOT_CORE=/nonexistent/core bash "$GATE" 2>&1)"
+missing_core_exit=$?
+if [ "$missing_core_exit" -eq 2 ] && printf '%s' "$missing_core_output" | grep -q "cannot source gate-lib.sh"; then
+  echo "PASS: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message"
+  pass_count=$((pass_count + 1))
+else
+  echo "FAIL: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message (exit=$missing_core_exit)"
+  echo "  output: $missing_core_output"
+  fail_count=$((fail_count + 1))
+fi
+
 cleanup_fixtures
 trap - EXIT
 

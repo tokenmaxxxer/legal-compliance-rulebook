@@ -335,6 +335,51 @@ print(json.dumps({"tool_name": "Bash", "tool_input": {"command": "cp foo docs/is
 
 run_case "Bash-tool write into gate scope -> deny" "$payload_12" 2
 
+# --- Case 13: structural-pairing regression (issue-16 D3 fix) -------------
+# Necessity language only in an unrelated early section; the Mitigations
+# section itself has no necessity language of its own or in an ancestor.
+# Previously false-allowed by the whole-document first-occurrence check.
+
+content_13='# Proposal
+
+## Scope
+
+In scope: the checkout API. Out of scope: billing. It is not necessary to
+configure anything further here.
+
+## Regulation enumeration
+
+We enumerate GDPR and CCPA. No exclusions.
+
+## Mitigations
+
+We propose mitigation of the identified risk.
+
+## Evidence / rationale
+
+- Position A cites Art. 5 of GDPR.
+'
+
+payload_13=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": "docs/issue-10/proposals/x-legal-compliance.md", "content": sys.stdin.read()}}))
+' <<<"$content_13")
+
+run_case "structural pairing: necessity only in unrelated section -> deny" "$payload_13" 2
+
+# --- Case 14: missing-core (core #75-class defect) -> deny exit 2 ---------
+
+missing_core_output="$(printf '%s' "$payload_3" | CLAUDE_PLUGIN_ROOT_CORE=/nonexistent/core bash "$GATE" 2>&1)"
+missing_core_exit=$?
+if [[ "$missing_core_exit" -eq 2 ]] && grep -q "cannot source gate-lib.sh" <<<"$missing_core_output"; then
+  echo "PASS: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message"
+  PASS_COUNT=$((PASS_COUNT + 1))
+else
+  echo "FAIL: missing-core (CLAUDE_PLUGIN_ROOT_CORE unreachable) denies with guard message (exit=$missing_core_exit)"
+  echo "  output: $missing_core_output"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
 echo
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 

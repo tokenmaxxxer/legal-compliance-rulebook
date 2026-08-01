@@ -11,25 +11,32 @@ copied — this script is new and role-specific).
 ## What it enforces
 
 Issue-1's phase-1 ("기획서" / proposal) norms a1–a4, mechanized as a
-`PreToolUse` gate on `Write`/`Edit`/`MultiEdit` calls.
+`PreToolUse` gate on `Write`/`Edit`/`MultiEdit`/`Bash`/`NotebookEdit`
+calls.
 
 ## What it checks
 
 Only fires on resolved write paths matching
 `docs/issue-<n>/proposals/.*legal-compliance.*\.md`. Any other path is
-allowed with no checks (no-op).
+allowed with no checks (no-op). `Write`/`Edit`/`MultiEdit`/`NotebookEdit`
+resolve the would-be final content (via `gate_reconstruct_write`) and
+check it; a `Bash` command whose tokens appear to write to a matching
+path is denied outright on principle (conservative branch — this gate
+cannot verify a Bash-tool write's resulting content).
 
 1. **Scope/boundary statement** — heuristic: a "scope" or "boundary"
    keyword near "in scope"/"out of scope" language, case-insensitive.
 2. **Regulation enumeration + exclusions** — a heading mentioning
    regulations/enumeration whose section body states at least one
    exclusion, or explicitly says "no exclusions".
-3. **Necessity/proportionality before mitigation** — the first
-   occurrence of "necessity"/"proportionality"/"proportionate" must
-   appear, in raw character offset, before the first occurrence of
-   "mitigat" anywhere in the document. This is the plugin's one ordering
-   check; it is computed by string-offset comparison within the single
-   document content the hook already receives on this call — no
+3. **Necessity/proportionality structurally paired with mitigation** —
+   for every section whose own body contains "mitigat" language, that
+   section (or an ancestor section, by heading nesting) must itself
+   contain "necessity"/"proportionality"/"proportionate" language at or
+   before the first "mitigat" occurrence within that section's own body.
+   Necessity language elsewhere in the document, outside that section's
+   own scope or its ancestors, does not satisfy this — it is a
+   structural pairing check, not a whole-document offset comparison. No
    cross-call state file is used or needed (the constraint is
    intra-document).
 4. **Evidence/rationale section** — a heading containing "evidence" or
@@ -43,8 +50,10 @@ item(s) named on stderr. All four checks pass → allow (exit 0).
 
 ## Kill switch
 
-Set `LEGAL_COMPLIANCE_PHASE1_GATE_OFF` to any non-empty value to bypass
-this gate entirely (exit 0 immediately, no checks run):
+Set `LEGAL_COMPLIANCE_PHASE1_GATE_OFF` to a recognized on-spelling
+(`1`/`true`/`yes`/`on`, case-insensitive) to bypass this gate entirely
+(exit 0 immediately, no checks run). Any other value — including the
+empty string or an unrecognized typo — leaves the gate active:
 
 ```bash
 LEGAL_COMPLIANCE_PHASE1_GATE_OFF=1 <command that writes the doc>
@@ -52,11 +61,14 @@ LEGAL_COMPLIANCE_PHASE1_GATE_OFF=1 <command that writes the doc>
 
 ## Fail-closed behavior
 
-The script uses `set -euo pipefail` plus a trap that turns any
-unexpected internal error into a deny (exit 2). Malformed stdin JSON,
-an `Edit`/`MultiEdit` whose `old_string` can't be found in the current
-file content, and any other internal exception all fail closed rather
-than allowing the write through.
+The script sources core's `gate-lib.sh` behind an `||` guard (missing/
+unreachable core fails closed with exit 2, not a silent allow), installs
+`gate_trap_fail_closed` as its first statement (an `EXIT` trap that turns
+any unexpected internal error into a deny), and runs under
+`set -uo pipefail` (no `-e`). Malformed stdin JSON, an `Edit`/`MultiEdit`/
+`NotebookEdit` whose edit can't be reconstructed against the current file
+content, and any other internal exception all fail closed rather than
+allowing the write through.
 
 ## Tests
 

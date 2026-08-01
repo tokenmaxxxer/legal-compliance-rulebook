@@ -9,7 +9,7 @@
 # 0 (allow) or 2 (deny, message on stderr). Fails closed on any unexpected
 # error.
 
-. "${CLAUDE_PLUGIN_ROOT_CORE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../core" && pwd -P)}/hooks/lib/gate-lib.sh"
+. "${CLAUDE_PLUGIN_ROOT_CORE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../core" && pwd -P)}/hooks/lib/gate-lib.sh" || { echo "phase1-proposal-gate.sh: cannot source gate-lib.sh" >&2; exit 2; }
 gate_trap_fail_closed
 set -uo pipefail
 gate_kill_switch_active "${LEGAL_COMPLIANCE_PHASE1_GATE_OFF:-}" || { trap - EXIT; exit 0; }
@@ -172,32 +172,64 @@ else:
             "(or explicit 'no exclusions')"
         )
 
-# (a3) Necessity/proportionality language must appear (in some section
-# body) at or before the section body first containing "mitigat".
+# (a3) Necessity/proportionality language must be structurally paired with
+# mitigation language: for every section whose own body contains "mitigat"
+# language, that section (or an ancestor section, by heading nesting) must
+# itself contain necessity/proportionality language at or before the first
+# "mitigat" occurrence within that section's own body. Unrelated necessity
+# language elsewhere in the document does not satisfy this.
 necessity_re = re.compile(r"necessity|proportionality|proportionate", re.IGNORECASE)
 mitigat_re = re.compile(r"mitigat", re.IGNORECASE)
 
-necessity_line = None
-mitigat_line = None
 
-for (i, lvl, _title) in headings:
-    body = section_body(lines, headings, i, lvl)
-    if necessity_line is None:
-        m = necessity_re.search(body)
-        if m:
-            necessity_line = i + 1 + body[:m.start()].count("\n")
-    if mitigat_line is None:
-        m = mitigat_re.search(body)
-        if m:
-            mitigat_line = i + 1 + body[:m.start()].count("\n")
+def own_body(lines, headings, idx):
+    # Text directly under this heading, up to its first child heading (of
+    # any level) — deliberately narrower than section_body, which spans
+    # the whole subtree. Structural pairing must not be satisfied by a
+    # top-level heading's subtree swallowing the entire document.
+    i = headings[idx][0]
+    end = len(lines)
+    for (j, _lvl, _t) in headings:
+        if j > i:
+            end = j
+            break
+    return "\n".join(lines[i + 1:end])
 
-if necessity_line is None:
+
+def ancestor_indices(headings, idx):
+    chain = []
+    cur_level = headings[idx][1]
+    for j in range(idx - 1, -1, -1):
+        if headings[j][1] < cur_level:
+            chain.append(j)
+            cur_level = headings[j][1]
+    return chain
+
+
+any_necessity_anywhere = bool(necessity_re.search(final_content))
+if not any_necessity_anywhere:
     missing.append("necessity/proportionality rationale language")
-elif mitigat_line is not None and necessity_line > mitigat_line:
-    missing.append(
-        "necessity/proportionality rationale must appear before the first "
-        "mention of mitigation (ordering violation)"
-    )
+else:
+    for idx, (i, lvl, _title) in enumerate(headings):
+        body = own_body(lines, headings, idx)
+        m = mitigat_re.search(body)
+        if not m:
+            continue
+        mitigat_offset = m.start()
+        own_necessity = necessity_re.search(body[:mitigat_offset]) is not None
+        if own_necessity:
+            continue
+        ancestor_necessity = any(
+            necessity_re.search(own_body(lines, headings, a))
+            for a in ancestor_indices(headings, idx)
+        )
+        if not ancestor_necessity:
+            missing.append(
+                "necessity/proportionality rationale must appear in the "
+                f"same section as (or an ancestor of) the mitigation "
+                f"language at or before its first mention (section "
+                f"{headings[idx][2]!r} has none in scope)"
+            )
 
 # (a4) Evidence/rationale section: per-bullet citation or explicit
 # "assumption, unsourced" label.

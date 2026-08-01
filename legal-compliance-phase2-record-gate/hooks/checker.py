@@ -225,10 +225,11 @@ for idx, line in enumerate(lines):
     if in_section or re.search(r"mitigat", text, re.IGNORECASE):
         mitigation_bullets.append(text)
 
-# `\brisk\b` dropped from ref_re per the confirmed audit bug: citing the
-# bare word "risk" is not a reference to any specific regulation/clause.
+# `\brisk\b` and `\bsection\b` dropped from ref_re per the confirmed audit
+# bugs: citing the bare word "risk" or "section" is not a reference to any
+# specific regulation/clause (issue-13, issue-16).
 ref_re = re.compile(
-    r"(Art\.|§|\bsection\b|\bclause\b|\bregulation\b|\bstandard\b|"
+    r"(Art\.|§|\bclause\b|\bregulation\b|\bstandard\b|"
     r"\bissue[-\s#]?\d+\b)",
     re.IGNORECASE,
 )
