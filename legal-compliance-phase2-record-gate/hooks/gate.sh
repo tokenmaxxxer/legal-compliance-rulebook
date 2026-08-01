@@ -1,35 +1,32 @@
 #!/usr/bin/env bash
-# phase2-record-gate: enforces issue-1 phase-2 record norms (b1-b5) on
-# docs/issue-<n>/reports/legal-compliance.md writes. Supersedes the four
-# presence checks in legal-compliance/hooks/record-fields-gate.sh (kept
-# byte-compatible with its grep patterns) plus a new 1:1 mitigation-bullet
-# to risk/clause-reference mapping heuristic. See
-# docs/issue-10/proposals/2026-07-31-methodology-enforcement.md (plugin 2).
-set -euo pipefail
+# legal-compliance-phase2-record-gate / hooks/gate.sh
+#
+# PreToolUse gate enforcing issue-1 phase-2 record norms (b1-b5) on
+# docs/issue-<n>/reports/legal-compliance.md writes, plus the 1:1
+# mitigation-to-risk/clause-reference mapping heuristic. See ../README.md
+# for what it checks.
+#
+# Contract: reads a PreToolUse JSON payload on stdin (Write/Edit/MultiEdit/
+# Bash/NotebookEdit), resolves the would-be final file content, and exits
+# 0 (allow) or 2 (deny, message on stderr). Fails closed on any unexpected
+# error. Thin wrapper: all parsing/checking logic lives in checker.py.
 
-on_err() {
-  echo "phase2-record-gate: internal error or malformed input — failing closed" >&2
-  exit 2
-}
-trap on_err ERR
+. "${CLAUDE_PLUGIN_ROOT_CORE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../core" && pwd -P)}/hooks/lib/gate-lib.sh"
+gate_trap_fail_closed
+set -uo pipefail
+gate_kill_switch_active "${LEGAL_COMPLIANCE_PHASE2_GATE_OFF:-}" || { trap - EXIT; exit 0; }
 
-# Kill switch: if set to any non-empty value, allow unconditionally.
-if [ -n "${LEGAL_COMPLIANCE_PHASE2_GATE_OFF:-}" ]; then
-  exit 0
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 payload="$(cat)"
 
-# Delegate JSON parsing, path resolution, and the field/heuristic checks
-# to checker.py. It prints nothing on allow; on deny it prints the
-# missing-element message(s) to stdout, which we relay to stderr. Exit
-# codes:
-#   0 = allow (including non-matching path)
-#   1 = deny (checks failed)
-#   anything else = unexpected -> trap turns it into exit 2
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$root" ]; then
+  echo "phase2-record-gate: could not determine project root — failing closed" >&2
+  exit 2
+fi
+
 set +e
-result="$(printf '%s' "$payload" | python3 "$SCRIPT_DIR/checker.py")"
+printf '%s' "$payload" | GATE_LIB_PY="$GATE_LIB_PY" GATE_ROOT="$root" python3 "$SCRIPT_DIR/checker.py"
 py_status=$?
 set -e
 
@@ -37,8 +34,8 @@ case "$py_status" in
   0)
     exit 0
     ;;
-  1)
-    echo "$result" >&2
+  2)
+    # checker.py already wrote its deny reason to stderr; nothing to relay.
     exit 2
     ;;
   *)

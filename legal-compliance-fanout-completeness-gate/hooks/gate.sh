@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# PreToolUse gate (Write|Edit|MultiEdit) — legal-compliance-fanout-completeness-gate
+. "${CLAUDE_PLUGIN_ROOT_CORE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../core" && pwd -P)}/hooks/lib/gate-lib.sh"
+gate_trap_fail_closed
+set -uo pipefail
+gate_kill_switch_active "${LEGAL_COMPLIANCE_FANOUT_GATE_OFF:-}" || { trap - EXIT; exit 0; }
+# PreToolUse gate (Write|Edit|MultiEdit|Bash|NotebookEdit) — legal-compliance-fanout-completeness-gate
 #
 # Enforces the freelunch / parallel-fan-out sourcing-completeness
 # methodology (this rulebook's own scout-brief.md 2-angle-sweep
@@ -9,32 +13,12 @@
 # at least two independently-attributed sources or angles. A document
 # that makes no such claim is not required to have anything.
 #
-# Shape (fail-closed trap, kill switch, resolve-then-match) follows the
-# pattern scouted from pricing-rulebook's methodology-gate.sh — this
-# script is new and role-specific, not a copy of that file's content.
-#
 # Fires on BOTH write surfaces:
 #   docs/issue-<n>/proposals/.*legal-compliance.*\.md
 #   docs/issue-<n>/reports/legal-compliance\.md
 # Any other resolved path: exit 0 immediately (no-op).
 #
-# Kill switch: export LEGAL_COMPLIANCE_FANOUT_GATE_OFF=1
-
-set -euo pipefail
-
-__fc() {
-  rc=$?
-  if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then
-    echo "legal-compliance-fanout-completeness-gate: fail-closed — gate aborted unexpectedly (rc=$rc)" >&2
-    exit 2
-  fi
-}
-trap __fc EXIT
-
-# Kill switch — any non-empty value disables the gate.
-if [ -n "${LEGAL_COMPLIANCE_FANOUT_GATE_OFF:-}" ]; then
-  exit 0
-fi
+# Kill switch: export LEGAL_COMPLIANCE_FANOUT_GATE_OFF=1 (or true/yes/on)
 
 deny() {
   echo "legal-compliance-fanout-completeness-gate: refused — $1" >&2
@@ -46,19 +30,25 @@ command -v python3 >/dev/null 2>&1 || deny "python3 is required but not found on
 payload="$(cat 2>/dev/null || true)"
 [ -n "$payload" ] || deny "empty tool-use payload on stdin; cannot evaluate the fan-out completeness gate."
 
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$root" ] || deny "cannot determine project root (git rev-parse --show-toplevel failed)."
+
 set +e
-GATE_PAYLOAD="$payload" python3 <<'PY'
-import json, os, re, sys
+GATE_PAYLOAD="$payload" GATE_ROOT="$root" GATE_LIB_PY="$GATE_LIB_PY" python3 <<'PY'
+import importlib.util, json, os, re, sys
 
 def deny(msg):
     sys.stderr.write("legal-compliance-fanout-completeness-gate: refused — %s\n" % msg)
     sys.exit(2)
 
+_spec = importlib.util.spec_from_file_location("gate_lib", os.environ["GATE_LIB_PY"])
+gate_lib = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate_lib)
+
 raw = os.environ.get("GATE_PAYLOAD", "")
-try:
-    event = json.loads(raw)
-except Exception:
-    deny("malformed JSON payload on stdin.")
+root = os.environ.get("GATE_ROOT", "")
+
+event = gate_lib.gate_parse_json_or_deny(raw, deny)
 
 if not isinstance(event, dict):
     deny("malformed JSON payload on stdin (not an object).")
@@ -68,62 +58,56 @@ tool_input = event.get("tool_input")
 if not isinstance(tool_input, dict):
     deny("tool_input missing or not an object in payload.")
 
+PROPOSAL_RE = re.compile(r"docs/issue-\d+/proposals/[^/]*legal-compliance[^/]*\.md$")
+RECORD_RE = re.compile(r"docs/issue-\d+/reports/legal-compliance\.md$")
+
+def matches(tail):
+    return bool(tail) and bool(PROPOSAL_RE.search(tail) or RECORD_RE.search(tail))
+
+if tool_name == "Bash":
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        command = ""
+    tokens = re.findall(r"[A-Za-z0-9_./~$-]+", command)
+    for tok in tokens:
+        tail = gate_lib.gate_normalize_path(root, tok)
+        if matches(tail):
+            deny(
+                "Bash command appears to write to %s, which matches a "
+                "legal-compliance proposal/record path; this gate cannot "
+                "verify a Bash write's resulting content, so it refuses "
+                "conservatively." % tail
+            )
+    sys.exit(0)
+
+if tool_name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+    # Matcher only wires these tools, but stay fail-closed-safe rather than
+    # guessing about an unrecognized tool.
+    sys.exit(0)
+
 file_path = tool_input.get("file_path")
 if not isinstance(file_path, str) or not file_path:
     # No file_path to resolve/match: nothing this gate can check.
     sys.exit(0)
 
-# Resolve to an absolute, real path before matching.
-resolved = os.path.realpath(file_path)
-resolved_posix = resolved.replace(os.sep, "/")
-
-PROPOSAL_RE = re.compile(r"docs/issue-\d+/proposals/[^/]*legal-compliance[^/]*\.md$")
-RECORD_RE = re.compile(r"docs/issue-\d+/reports/legal-compliance\.md$")
-
-if not (PROPOSAL_RE.search(resolved_posix) or RECORD_RE.search(resolved_posix)):
+tail = gate_lib.gate_normalize_path(root, file_path)
+if not matches(tail):
     sys.exit(0)
 
 # --- Compute the final content that would result from this write ---
-if tool_name == "Write":
-    content = tool_input.get("content")
-    if not isinstance(content, str):
-        deny("Write tool_input.content missing or not a string.")
+try:
+    with open(file_path, "r", encoding="utf-8") as f:
+        current_content = f.read()
+except FileNotFoundError:
+    current_content = ""
+except Exception as e:
+    deny("could not read existing file %s to apply edit: %s" % (file_path, e))
 
-elif tool_name in ("Edit", "MultiEdit"):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        content = ""
-    except Exception as e:
-        deny("could not read existing file %s to apply edit: %s" % (file_path, e))
+new_text, ok = gate_lib.gate_reconstruct_write(tool_name, tool_input, current_content)
+if not ok:
+    deny("could not reconstruct resulting content for %s from this %s call." % (file_path, tool_name))
 
-    if tool_name == "Edit":
-        old = tool_input.get("old_string")
-        new = tool_input.get("new_string")
-        if not isinstance(old, str) or not isinstance(new, str):
-            deny("Edit tool_input missing old_string/new_string.")
-        if old not in content:
-            deny("Edit old_string not found in current content of %s." % file_path)
-        content = content.replace(old, new, 1)
-    else:
-        edits = tool_input.get("edits")
-        if not isinstance(edits, list) or not edits:
-            deny("MultiEdit tool_input.edits missing or empty.")
-        for i, e in enumerate(edits):
-            if not isinstance(e, dict):
-                deny("MultiEdit edits[%d] is not an object." % i)
-            old = e.get("old_string")
-            new = e.get("new_string")
-            if not isinstance(old, str) or not isinstance(new, str):
-                deny("MultiEdit edits[%d] missing old_string/new_string." % i)
-            if old not in content:
-                deny("MultiEdit edits[%d] old_string not found in current content of %s." % (i, file_path))
-            content = content.replace(old, new, 1)
-else:
-    # Matcher only wires Write|Edit|MultiEdit, but stay fail-closed-safe
-    # rather than guessing about an unrecognized tool.
-    sys.exit(0)
+content = new_text
 
 # --- Methodology check ---
 
